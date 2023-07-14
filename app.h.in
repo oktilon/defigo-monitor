@@ -1,0 +1,25 @@
+#ifndef App_H
+#define App_H
+
+#include <stdarg.h>
+
+#define VERSION_MAJOR @version_major@
+#define VERSION_MINOR @version_minor@
+#define VERSION_REV @version_rev@
+
+#define MONITOR_NAME_PREFIX "@monitor_name_prefix@"
+#define MONITOR_PATH_PREFIX "@monitor_path_prefix@"
+
+// Logh levels
+#define LOG_LEVEL_ERROR     0
+#define LOG_LEVEL_INFO      1
+#define LOG_LEVEL_DEBUG     2
+
+void selfLogFunction(const char *file, int line, const char *func, int lvl, const char* fmt, ...);
+#define selfLog(LVL, FMT, ...) selfLogFunction((const char *)(__FILE__), __LINE__, (const char *)(__func__), LVL, FMT __VA_OPT__(,) __VA_ARGS__)
+#define selfLogInf(FMT, ...) selfLogFunction((const char *)(__FILE__), __LINE__, (const char *)(__func__), LOG_LEVEL_INFO, FMT __VA_OPT__(,) __VA_ARGS__)
+#define selfLogDbg(FMT, ...) selfLogFunction((const char *)(__FILE__), __LINE__, (const char *)(__func__), LOG_LEVEL_DEBUG, FMT __VA_OPT__(,) __VA_ARGS__)
+#define selfLogErr(FMT, ...) selfLogFunction((const char *)(__FILE__), __LINE__, (const char *)(__func__), LOG_LEVEL_ERROR, FMT __VA_OPT__(,) __VA_ARGS__)
+
+
+#endif // App_H
