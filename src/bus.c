@@ -1,6 +1,7 @@
 #include <stdbool.h>
 #include <errno.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "bus.h"
 #include "app.h"
@@ -10,8 +11,20 @@
 #define IFACE_SZ    256
 #define PROPERTY_GET    127
 
+typedef struct CallCacheStruct {
+    char sender[32];
+    char dest[IFACE_SZ + 1];
+    char serv[NAME_SZ + 1];
+    char iface[IFACE_SZ + 1];
+    char member[NAME_SZ + 1];
+    uint64_t cookie;
+    struct CallCacheStruct *next;
+} CallCache;
+
 sd_bus *bus = NULL; /** DBus pointer */
 const char* unique_name = NULL;
+CallCache *cache;
+int cacheSize = 0;
 
 int bus_append_argument(bool is_argument_a_string, const char *argument_to_append, char **arguments_string) {
     if (argument_to_append == NULL) {
@@ -100,9 +113,9 @@ int bus_message_decode(sd_bus_message *m, char **arguments) {
                 if (error < 0)
                     goto error_out;
 
-                buffer_size = snprintf(NULL, 0, "%d", argument_boolean);
+                buffer_size = snprintf(NULL, 0, "%s", argument_boolean ? "true" : "false");
                 string_representation_of_argument = (char*)calloc(1, (size_t) buffer_size + 1);
-                error = snprintf(string_representation_of_argument, (size_t) buffer_size + 1, "%d", argument_boolean);
+                error = snprintf(string_representation_of_argument, (size_t) buffer_size + 1, "%s", argument_boolean ? "true" : "false");
                 if (error < 0)
                     goto error_out;
 
@@ -433,6 +446,40 @@ out:
     return (error < 0) ? error : 0;
 }
 
+void cache_push (CallCache *item) {
+    CallCache *it = cache;
+    if (!it) {
+        cache = item;
+    } else {
+        while (it->next) {
+            it = it->next;
+        }
+        if (it) {
+            it->next = item;
+        }
+    }
+}
+
+CallCache * cache_has (const char *snd, uint64_t cookie) {
+    CallCache *prev = NULL;
+    CallCache *it = cache;
+    while (it) {
+        bool s = strcmp(it->sender, snd) == 0;
+        bool c = it->cookie == cookie;
+        if (s && c) {
+            if (prev) {
+                prev->next = it->next;
+            } else {
+                cache = it->next;
+            }
+            it->next = NULL;
+            return it;
+        }
+        prev = it;
+        it = it->next;
+    }
+    return NULL;
+}
 
 void bus_monitor_handler(sd_bus_message *m) {
     uint8_t uType = 0;
@@ -440,23 +487,68 @@ void bus_monitor_handler(sd_bus_message *m) {
     char iface[IFACE_SZ + 1] = {0};
     char *data = NULL;
     bool bName = false;
+    uint64_t cookie = 0UL;
+    uint64_t replyCookie = 0UL;
+    CallCache *reply = NULL;
+    CallCache *it = NULL;
     const char *pp, *pnm;
+    // const char *stp = "UNK";
     int r = sd_bus_message_get_type(m, &uType);
     if(r < 0) {
         selfLogErr("Failed to get message type(%d): %s", r, strerror(-r));
     }
 
-    const char *piface = sd_bus_message_get_interface(m);
-    const char *memb = sd_bus_message_get_member(m);
+    // switch(uType) {
+    //     case SD_BUS_MESSAGE_METHOD_CALL: stp = "CALL"; break;
+    //     case PROPERTY_GET: stp = "GET"; break;
+    //     case SD_BUS_MESSAGE_SIGNAL: stp = "SIGNAL"; break;
+    //     case SD_BUS_MESSAGE_METHOD_RETURN: stp = "REPLY"; break;
+    //     case SD_BUS_MESSAGE_METHOD_ERROR: stp = "ERROR"; break;
+    //     default: break;
+    // }
 
-    if(strcmp(memb, "PropertiesChanged") == 0) { // sa{sv}as
+    const char *piface = sd_bus_message_get_interface (m);
+    const char *memb = sd_bus_message_get_member (m);
+    const char *snd = sd_bus_message_get_sender (m);
+    const char *dst = sd_bus_message_get_destination (m);
+    sd_bus_message_get_cookie (m, &cookie);
+    sd_bus_message_get_reply_cookie (m, &replyCookie);
+
+    // selfLogInf("Parse %s from %s to %s if:%s, mem:%s [c:%lld, rc:%lld]", stp, snd, dst, piface, memb, cookie, replyCookie);
+
+    if (uType == SD_BUS_MESSAGE_METHOD_CALL) {
+        it = (CallCache *) calloc (1, sizeof(CallCache));
+        strncpy(it->sender, snd, 31);
+        strncpy(it->dest, dst, IFACE_SZ);
+        it->cookie = cookie;
+    }
+
+    if (uType == SD_BUS_MESSAGE_METHOD_RETURN) {
+        reply = cache_has (dst, replyCookie);
+        if (!reply) return;
+        memb = reply->member;
+        snd = reply->dest;
+        piface = reply->iface;
+        strcpy (name, reply->serv);
+    }
+
+    if (uType == SD_BUS_MESSAGE_METHOD_ERROR) {
+        reply = cache_has (dst, replyCookie);
+        if (!reply) return;
+        memb = reply->member;
+        snd = reply->dest;
+        piface = reply->iface;
+        strcpy (name, reply->serv);
+    }
+
+    if(memb && strcmp(memb, "PropertiesChanged") == 0) { // sa{sv}as
         r = sd_bus_message_read_basic(m, 's', &piface);
         if( r < 0 ) {
             selfLogErr("Failed to read PropertiesChanged interface(%d): %s", r, strerror(-r));
             piface = sd_bus_message_get_interface(m);
         }
     }
-    if(strcmp(piface, "org.freedesktop.DBus.Properties") == 0 && strcmp(memb, "Get") == 0) {
+    if(piface && strcmp(piface, "org.freedesktop.DBus.Properties") == 0 && strcmp(memb, "Get") == 0) {
         r = sd_bus_message_read_basic(m, 's', &piface);
         if( r < 0 ) {
             selfLogErr("Failed to read Get interface(%d): %s", r, strerror(-r));
@@ -469,23 +561,34 @@ void bus_monitor_handler(sd_bus_message *m) {
         }
         uType = PROPERTY_GET;
     }
-    pp = strstr(piface, MONITOR_NAME_PREFIX);
-    if(pp) {
-        pnm = piface + strlen(MONITOR_NAME_PREFIX);
-        bName = true;
-    } else {
-        pnm = piface;
-    }
-    pp = strstr(pnm, ".");
-    if(bName) {
-        strncpy(name, pnm, NAME_SZ);
+    if (piface) {
+        pp = strstr(piface, MONITOR_NAME_PREFIX);
         if(pp) {
-            name[pp-pnm] = 0;
-            strncpy(iface, pp + 1, IFACE_SZ);
+            pnm = piface + strlen(MONITOR_NAME_PREFIX);
+            bName = true;
+        } else {
+            pnm = piface;
         }
-    } else {
-        strncpy(iface, piface, IFACE_SZ);
+        pp = strstr(pnm, ".");
+        if(bName) {
+            strncpy(name, pnm, NAME_SZ);
+            if(pp) {
+                name[pp-pnm] = 0;
+                strncpy(iface, pp + 1, IFACE_SZ);
+            }
+        } else {
+            strncpy(iface, piface, IFACE_SZ);
+        }
     }
+
+    if (it) {
+        strncpy(it->member, memb, NAME_SZ);
+        strcpy(it->iface, iface);
+        strcpy(it->serv, name);
+        cache_push (it);
+    }
+
+
     bus_message_decode(m, &data);
     switch(uType) {
         case SD_BUS_MESSAGE_METHOD_CALL:
@@ -501,12 +604,19 @@ void bus_monitor_handler(sd_bus_message *m) {
             break;
 
         case SD_BUS_MESSAGE_METHOD_RETURN:
-            selfLogInf("\033[1;31mR \033[1;32m%s \033[0m[\033[1;33m%s\033[0m] (\033[0;35m%s\033[0m) from \033[0;37m%s\033[0m", memb, name, data ? data : "-", iface);
+            selfLogInf("\033[1;91mR \033[1;32m%s \033[0m[\033[1;33m%s\033[0m] (\033[0;35m%s\033[0m) from \033[0;37m%s\033[0m", memb, name, data ? data : "-", iface);
             break;
 
         case SD_BUS_MESSAGE_METHOD_ERROR:
             selfLogInf("\033[1;31mE \033[1;32m%s \033[0m[\033[1;33m%s\033[0m] (\033[0;35m%s\033[0m) from \033[0;37m%s\033[0m", memb, name, data ? data : "-", iface);
             break;
+
+        default:
+            selfLogInf("Unknown message type");
+    }
+
+    if (reply) {
+        free (reply);
     }
 
 }
@@ -515,17 +625,11 @@ int bus_init() {
     sd_bus_error err = SD_BUS_ERROR_NULL;
     sd_bus_message *call;
     uint32_t flags = 0u;
-    char match[MATCH_SZ] = {0};
-    int r = sd_bus_open_system(&bus);
+    int r;
+
+    r = sd_bus_open_system(&bus);
     if(r < 0) {
         selfLogErr("Failed to connect to session bus(%d): %s", r, strerror(-r));
-        return r;
-    }
-
-    // Prepare match expression
-    int sz = snprintf(match, MATCH_SZ, "path_namespace='%s',eavesdrop='true'", MONITOR_PATH_PREFIX);
-    if( sz <= 0 ) {
-        selfLogErr("Failed to prepare match expression: %d", sz);
         return r;
     }
 
@@ -545,24 +649,30 @@ int bus_init() {
     r = sd_bus_message_open_container(call, 'a', "s");
     if( r < 0) {
         selfLogErr("Failed create message container(%d): %s", r, strerror(-r));
+        sd_bus_message_unref (call);
         return r;
     }
 
-    r = sd_bus_message_append_basic(call, 's', match);
-    if( r < 0) {
-        selfLogErr("Failed append message string(%d): %s", r, strerror(-r));
-        return r;
-    }
+    r = sd_bus_message_append_basic(call, 's', "path_namespace='/com/getdefigo',eavesdrop='true'");
+    if (r < 0) selfLogErr("Failed append path_namespace(%d): %s", r, strerror(-r));
+
+    r = sd_bus_message_append_basic(call, 's', "type='method_return',eavesdrop='true'");
+    if( r < 0) selfLogErr("Failed append type=method_return(%d): %s", r, strerror(-r));
+
+    r = sd_bus_message_append_basic(call, 's', "type='error',eavesdrop='true'");
+    if( r < 0) selfLogErr("Failed append type=error(%d): %s", r, strerror(-r));
 
     r = sd_bus_message_close_container(call);
     if( r < 0) {
         selfLogErr("Failed close message container(%d): %s", r, strerror(-r));
+        sd_bus_message_unref (call);
         return r;
     }
 
     r = sd_bus_message_append_basic(call, 'u', &flags);
     if( r < 0) {
         selfLogErr("Failed append message uint(%d): %s", r, strerror(-r));
+        sd_bus_message_unref (call);
         return r;
     }
 
@@ -570,26 +680,19 @@ int bus_init() {
     if( r < 0) {
         selfLogErr("Failed to become Monitor(%d): %s", r, strerror(-r));
         if(err.message) selfLogErr("Failed message: %s", err.message);
+        sd_bus_message_unref (call);
         return r;
     }
+
+    sd_bus_message_unref (call);
 
     r = sd_bus_get_unique_name(bus, &unique_name);
     if (r < 0) {
         selfLogErr("Failed to become Monitor(%d): %s", r, strerror(-r));
         return r;
     } else {
-        selfLogInf("Unique name: %s", unique_name);
+        selfLogInf("Monitor unique name: %s", unique_name);
     }
-
-
-    // // Subscribe
-    // r = sd_bus_add_match(bus, NULL, match, bus_monitor_handler, NULL);
-    // if(r < 0) {
-    //     selfLogErr("Failed to add match(%d): %s", r, strerror(-r));
-    //     return r;
-    // } else {
-    //     selfLogInf("Added match [%s]", match);
-    // }
     return 0;
 }
 
