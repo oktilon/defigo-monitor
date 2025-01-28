@@ -3,13 +3,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "bus.h"
+#include "app_bus.h"
 #include "app.h"
 
-#define MATCH_SZ    128
-#define NAME_SZ     64
-#define IFACE_SZ    256
-#define PROPERTY_GET    127
+#define NAME_SZ         64
+#define IFACE_SZ        256
+#define PROPERTY_GET    126
+#define PROPERTY_SET    127
 
 typedef struct CallCacheStruct {
     char sender[32];
@@ -25,6 +25,65 @@ sd_bus *bus = NULL; /** DBus pointer */
 const char* unique_name = NULL;
 CallCache *cache;
 int cacheSize = 0;
+
+message_item_t *cache = NULL;
+
+// static const char * bus_get_type_name (uint8_t type) {
+//     switch (type) {
+//         case SD_BUS_MESSAGE_METHOD_CALL: return "Call"; break;
+//         case SD_BUS_MESSAGE_METHOD_RETURN: return "Ret"; break;
+//         case SD_BUS_MESSAGE_METHOD_ERROR: return "Err"; break;
+//         case SD_BUS_MESSAGE_SIGNAL: return "Sig"; break;
+//         default: break;
+//     }
+//     return "Unk";
+// }
+
+static message_item_t * bus_search_cache (uint64_t reply_cookie) {
+    message_item_t *pr = NULL;
+    message_item_t *it = cache;
+    while (it) {
+        if (it->cookie == reply_cookie) {
+            if (pr) {
+                pr->next = it->next;
+            } else {
+                cache = it->next;
+            }
+            return it;
+        }
+        pr = it;
+        it = it->next;
+    }
+    return NULL;
+}
+
+static void bus_add_cache (uint64_t cookie, const char *memb, const char *name, const char *iface) {
+    message_item_t *pr;
+    message_item_t *it = (message_item_t *)calloc (sizeof(message_item_t), 1);
+    it->cookie = cookie;
+    it->memb = strdup (memb);
+    it->name = strdup (name);
+    it->iface = strdup (iface);
+    it->next = NULL;
+
+    int count = 0;
+
+    if (cache) {
+        pr = cache;
+        count = 1;
+        while (pr->next) {
+            pr = pr->next;
+            count++;
+        }
+        pr->next = it;
+    } else {
+        cache = it;
+    }
+    count++;
+
+    selfLogDbg ("Cache count = %d", count);
+}
+
 
 int bus_append_argument(bool is_argument_a_string, const char *argument_to_append, char **arguments_string) {
     if (argument_to_append == NULL) {
@@ -460,6 +519,7 @@ void cache_push (CallCache *item) {
     }
 }
 
+
 CallCache * cache_has (const char *snd, uint64_t cookie) {
     CallCache *prev = NULL;
     CallCache *it = cache;
@@ -481,31 +541,87 @@ CallCache * cache_has (const char *snd, uint64_t cookie) {
     return NULL;
 }
 
+void bus_monitor_properties_changed (sd_bus_message *m, const char *name, const char *iface) {
+    const char *memb;
+    char *data = NULL;
+    // Changed properties
+    int k, r = sd_bus_message_enter_container (m, SD_BUS_TYPE_ARRAY, "{sv}");
+    if (r >= 0) {
+        while (sd_bus_message_at_end (m, false) == 0) {
+            r = sd_bus_message_enter_container (m, SD_BUS_TYPE_DICT_ENTRY, "sv");
+            if (r < 0) {
+                selfLogErr ("Changed property open error(%d): %s", r, strerror(-r));
+                break;
+            }
+            while (sd_bus_message_at_end (m, false) == 0) {
+                r = sd_bus_message_read_basic(m, 's', &memb);
+                if (r < 0) {
+                    selfLogErr ("Changed property name error(%d): %s", r, strerror(-r));
+                    memb = "<Unknown>";
+                }
+
+                bus_message_decode(m, &data);
+
+                selfLogInf("\033[1;32mC \033[1;36m%s \033[0m[\033[1;33m%s\033[0m] (\033[0;35m%s\033[0m) from \033[0;37m%s\033[0m", memb, name, data ? data : "-", iface);
+            }
+
+            r = sd_bus_message_exit_container (m);
+            if (r < 0) {
+                selfLogErr ("Changed property close error(%d): %s", r, strerror(-r));
+            }
+        }
+    } else {
+        k = sd_bus_message_skip (m, "a{sv}");
+        selfLogErr ("Changed properties array open error(%d): %s (skip(%d): %s)"
+            , r, strerror(abs(r)), k, strerror(abs(k)));
+    }
+
+    // Invalidated properties
+    r = sd_bus_message_enter_container (m, SD_BUS_TYPE_ARRAY, "s");
+    if (r >= 0) {
+        while (sd_bus_message_at_end (m, false) == 0) {
+            r = sd_bus_message_read_basic(m, 's', &memb);
+            if (r < 0) {
+                selfLogErr ("Invalidated property name error(%d): %s", r, strerror(-r));
+                memb = "<Unknown>";
+            }
+
+            selfLogInf("\033[1;90mI \033[1;35m%s \033[0m[\033[1;33m%s\033[0m] from \033[0;37m%s\033[0m", memb, name, iface);
+        }
+    } else {
+        k = sd_bus_message_skip (m, "as");
+        selfLogErr ("Invalidated properties array open error(%d): %s (skip(%d): %s)"
+            , r, strerror(abs(r)), k, strerror(abs(k)));
+    }
+}
+
 void bus_monitor_handler(sd_bus_message *m) {
     uint8_t uType = 0;
+    uint64_t cookie = 0;
+    message_item_t *prev = NULL;
     char name[NAME_SZ + 1] = {0};
     char iface[IFACE_SZ + 1] = {0};
     char *data = NULL;
     bool bName = false;
-    uint64_t cookie = 0UL;
-    uint64_t replyCookie = 0UL;
-    CallCache *reply = NULL;
-    CallCache *it = NULL;
+    bool bPropChange = false;
     const char *pp, *pnm;
-    // const char *stp = "UNK";
+    const char *piface = "";
+    const char *memb = "";
     int r = sd_bus_message_get_type(m, &uType);
     if(r < 0) {
-        selfLogErr("Failed to get message type(%d): %s", r, strerror(-r));
+        selfLogErr ("Failed to get message type(%d): %s", r, strerror(-r));
+        return;
     }
+    // selfLogInf ("Catch %s", bus_get_type_name (uType));
 
-    // switch(uType) {
-    //     case SD_BUS_MESSAGE_METHOD_CALL: stp = "CALL"; break;
-    //     case PROPERTY_GET: stp = "GET"; break;
-    //     case SD_BUS_MESSAGE_SIGNAL: stp = "SIGNAL"; break;
-    //     case SD_BUS_MESSAGE_METHOD_RETURN: stp = "REPLY"; break;
-    //     case SD_BUS_MESSAGE_METHOD_ERROR: stp = "ERROR"; break;
-    //     default: break;
-    // }
+    if (uType == SD_BUS_MESSAGE_METHOD_RETURN) {
+        sd_bus_message_get_reply_cookie (m, &cookie);
+        prev = bus_search_cache (cookie);
+    } else {
+        sd_bus_message_get_cookie (m, &cookie);
+        piface = sd_bus_message_get_interface(m);
+        memb = sd_bus_message_get_member(m);
+    }
 
     const char *piface = sd_bus_message_get_interface (m);
     const char *memb = sd_bus_message_get_member (m);
@@ -546,6 +662,8 @@ void bus_monitor_handler(sd_bus_message *m) {
         if( r < 0 ) {
             selfLogErr("Failed to read PropertiesChanged interface(%d): %s", r, strerror(-r));
             piface = sd_bus_message_get_interface(m);
+        } else {
+            bPropChange = true;
         }
     }
     if(piface && strcmp(piface, "org.freedesktop.DBus.Properties") == 0 && strcmp(memb, "Get") == 0) {
@@ -561,8 +679,20 @@ void bus_monitor_handler(sd_bus_message *m) {
         }
         uType = PROPERTY_GET;
     }
-    if (piface) {
-        pp = strstr(piface, MONITOR_NAME_PREFIX);
+    if(strcmp(piface, "org.freedesktop.DBus.Properties") == 0 && strcmp(memb, "Set") == 0) {
+        r = sd_bus_message_read_basic(m, 's', &piface);
+        if( r < 0 ) {
+            selfLogErr("Failed to read Set interface(%d): %s", r, strerror(-r));
+            piface = sd_bus_message_get_interface(m);
+        }
+        r = sd_bus_message_read_basic(m, 's', &memb);
+        if( r < 0 ) {
+            selfLogErr("Failed to read Get interface(%d): %s", r, strerror(-r));
+            piface = sd_bus_message_get_interface(m);
+        }
+        uType = PROPERTY_SET;
+    }
+    pp = strstr(piface, MONITOR_NAME_PREFIX);
         if(pp) {
             pnm = piface + strlen(MONITOR_NAME_PREFIX);
             bName = true;
@@ -580,23 +710,25 @@ void bus_monitor_handler(sd_bus_message *m) {
             strncpy(iface, piface, IFACE_SZ);
         }
     }
-
-    if (it) {
-        strncpy(it->member, memb, NAME_SZ);
-        strcpy(it->iface, iface);
-        strcpy(it->serv, name);
-        cache_push (it);
+    if (bPropChange) {
+        bus_monitor_properties_changed (m, name, iface);
+        return;
     }
-
-
     bus_message_decode(m, &data);
     switch(uType) {
         case SD_BUS_MESSAGE_METHOD_CALL:
             selfLogInf("\033[1;31mM \033[1;93m%s \033[0m[\033[1;33m%s\033[0m] (\033[0;35m%s\033[0m) to \033[0;37m%s\033[0m", memb, name, data ? data : "-", iface);
+            bus_add_cache (cookie, memb, name, iface);
+            break;
+
+        case PROPERTY_SET:
+            selfLogInf("\033[1;93mW \033[1;95m%s \033[0m[\033[1;33m%s\033[0m] (\033[0;35m%s\033[0m) from \033[0;37m%s\033[0m", memb, name, data ? data : "-", iface);
+            bus_add_cache (cookie, memb, name, iface);
             break;
 
         case PROPERTY_GET:
             selfLogInf("\033[1;93mP \033[1;95m%s \033[0m[\033[1;33m%s\033[0m] from \033[0;37m%s\033[0m", memb, name, iface);
+            bus_add_cache (cookie, memb, name, iface);
             break;
 
         case SD_BUS_MESSAGE_SIGNAL:
@@ -604,7 +736,11 @@ void bus_monitor_handler(sd_bus_message *m) {
             break;
 
         case SD_BUS_MESSAGE_METHOD_RETURN:
-            selfLogInf("\033[1;91mR \033[1;32m%s \033[0m[\033[1;33m%s\033[0m] (\033[0;35m%s\033[0m) from \033[0;37m%s\033[0m", memb, name, data ? data : "-", iface);
+            if (prev) {
+                selfLogInf("\033[1;31mR \033[1;32m%s \033[0m[\033[1;33m%s\033[0m] (\033[0;35m%s\033[0m) from \033[0;37m%s\033[0m", prev->memb, prev->name, data ? data : "-", prev->iface);
+            } else {
+                // selfLogInf("\033[1;31mR \033[1;32m%d \033[0m(\033[0;35m%s\033[0m)", cookie, data ? data : "-");
+            }
             break;
 
         case SD_BUS_MESSAGE_METHOD_ERROR:
@@ -625,9 +761,7 @@ int bus_init() {
     sd_bus_error err = SD_BUS_ERROR_NULL;
     sd_bus_message *call;
     uint32_t flags = 0u;
-    int r;
-
-    r = sd_bus_open_system(&bus);
+    int r = sd_bus_open_system(&bus);
     if(r < 0) {
         selfLogErr("Failed to connect to session bus(%d): %s", r, strerror(-r));
         return r;

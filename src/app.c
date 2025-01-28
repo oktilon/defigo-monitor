@@ -15,7 +15,7 @@
 #include <getopt.h>
 
 #include "app.h"
-#include "bus.h"
+#include "app_bus.h"
 
 
 int logLevel = LOG_LEVEL_INFO;
