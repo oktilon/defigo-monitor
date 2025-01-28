@@ -11,20 +11,8 @@
 #define PROPERTY_GET    126
 #define PROPERTY_SET    127
 
-typedef struct CallCacheStruct {
-    char sender[32];
-    char dest[IFACE_SZ + 1];
-    char serv[NAME_SZ + 1];
-    char iface[IFACE_SZ + 1];
-    char member[NAME_SZ + 1];
-    uint64_t cookie;
-    struct CallCacheStruct *next;
-} CallCache;
-
 sd_bus *bus = NULL; /** DBus pointer */
 const char* unique_name = NULL;
-CallCache *cache;
-int cacheSize = 0;
 
 message_item_t *cache = NULL;
 
@@ -82,6 +70,15 @@ static void bus_add_cache (uint64_t cookie, const char *memb, const char *name, 
     count++;
 
     selfLogDbg ("Cache count = %d", count);
+}
+
+static void bus_free_cache (message_item_t *it) {
+    if (it) {
+        free (it->memb);
+        free (it->name);
+        free (it->iface);
+        free (it);
+    }
 }
 
 
@@ -505,42 +502,6 @@ out:
     return (error < 0) ? error : 0;
 }
 
-void cache_push (CallCache *item) {
-    CallCache *it = cache;
-    if (!it) {
-        cache = item;
-    } else {
-        while (it->next) {
-            it = it->next;
-        }
-        if (it) {
-            it->next = item;
-        }
-    }
-}
-
-
-CallCache * cache_has (const char *snd, uint64_t cookie) {
-    CallCache *prev = NULL;
-    CallCache *it = cache;
-    while (it) {
-        bool s = strcmp(it->sender, snd) == 0;
-        bool c = it->cookie == cookie;
-        if (s && c) {
-            if (prev) {
-                prev->next = it->next;
-            } else {
-                cache = it->next;
-            }
-            it->next = NULL;
-            return it;
-        }
-        prev = it;
-        it = it->next;
-    }
-    return NULL;
-}
-
 void bus_monitor_properties_changed (sd_bus_message *m, const char *name, const char *iface) {
     const char *memb;
     char *data = NULL;
@@ -617,45 +578,17 @@ void bus_monitor_handler(sd_bus_message *m) {
     if (uType == SD_BUS_MESSAGE_METHOD_RETURN) {
         sd_bus_message_get_reply_cookie (m, &cookie);
         prev = bus_search_cache (cookie);
+    } else if (uType == SD_BUS_MESSAGE_METHOD_ERROR) {
+        sd_bus_message_get_reply_cookie (m, &cookie);
+        prev = bus_search_cache (cookie);
     } else {
         sd_bus_message_get_cookie (m, &cookie);
         piface = sd_bus_message_get_interface(m);
         memb = sd_bus_message_get_member(m);
     }
 
-    const char *piface = sd_bus_message_get_interface (m);
-    const char *memb = sd_bus_message_get_member (m);
-    const char *snd = sd_bus_message_get_sender (m);
-    const char *dst = sd_bus_message_get_destination (m);
-    sd_bus_message_get_cookie (m, &cookie);
-    sd_bus_message_get_reply_cookie (m, &replyCookie);
-
-    // selfLogInf("Parse %s from %s to %s if:%s, mem:%s [c:%lld, rc:%lld]", stp, snd, dst, piface, memb, cookie, replyCookie);
-
-    if (uType == SD_BUS_MESSAGE_METHOD_CALL) {
-        it = (CallCache *) calloc (1, sizeof(CallCache));
-        strncpy(it->sender, snd, 31);
-        strncpy(it->dest, dst, IFACE_SZ);
-        it->cookie = cookie;
-    }
-
-    if (uType == SD_BUS_MESSAGE_METHOD_RETURN) {
-        reply = cache_has (dst, replyCookie);
-        if (!reply) return;
-        memb = reply->member;
-        snd = reply->dest;
-        piface = reply->iface;
-        strcpy (name, reply->serv);
-    }
-
-    if (uType == SD_BUS_MESSAGE_METHOD_ERROR) {
-        reply = cache_has (dst, replyCookie);
-        if (!reply) return;
-        memb = reply->member;
-        snd = reply->dest;
-        piface = reply->iface;
-        strcpy (name, reply->serv);
-    }
+    // const char *snd = sd_bus_message_get_sender (m);
+    // const char *dst = sd_bus_message_get_destination (m);
 
     if(memb && strcmp(memb, "PropertiesChanged") == 0) { // sa{sv}as
         r = sd_bus_message_read_basic(m, 's', &piface);
@@ -692,29 +625,32 @@ void bus_monitor_handler(sd_bus_message *m) {
         }
         uType = PROPERTY_SET;
     }
+
     pp = strstr(piface, MONITOR_NAME_PREFIX);
-        if(pp) {
-            pnm = piface + strlen(MONITOR_NAME_PREFIX);
-            bName = true;
-        } else {
-            pnm = piface;
-        }
-        pp = strstr(pnm, ".");
-        if(bName) {
-            strncpy(name, pnm, NAME_SZ);
-            if(pp) {
-                name[pp-pnm] = 0;
-                strncpy(iface, pp + 1, IFACE_SZ);
-            }
-        } else {
-            strncpy(iface, piface, IFACE_SZ);
-        }
+    if(pp) {
+        pnm = piface + strlen(MONITOR_NAME_PREFIX);
+        bName = true;
+    } else {
+        pnm = piface;
     }
+    pp = strstr(pnm, ".");
+    if(bName) {
+        strncpy(name, pnm, NAME_SZ);
+        if(pp) {
+            name[pp-pnm] = 0;
+            strncpy(iface, pp + 1, IFACE_SZ);
+        }
+    } else {
+        strncpy(iface, piface, IFACE_SZ);
+    }
+
     if (bPropChange) {
         bus_monitor_properties_changed (m, name, iface);
         return;
     }
+
     bus_message_decode(m, &data);
+
     switch(uType) {
         case SD_BUS_MESSAGE_METHOD_CALL:
             selfLogInf("\033[1;31mM \033[1;93m%s \033[0m[\033[1;33m%s\033[0m] (\033[0;35m%s\033[0m) to \033[0;37m%s\033[0m", memb, name, data ? data : "-", iface);
@@ -738,21 +674,21 @@ void bus_monitor_handler(sd_bus_message *m) {
         case SD_BUS_MESSAGE_METHOD_RETURN:
             if (prev) {
                 selfLogInf("\033[1;31mR \033[1;32m%s \033[0m[\033[1;33m%s\033[0m] (\033[0;35m%s\033[0m) from \033[0;37m%s\033[0m", prev->memb, prev->name, data ? data : "-", prev->iface);
-            } else {
-                // selfLogInf("\033[1;31mR \033[1;32m%d \033[0m(\033[0;35m%s\033[0m)", cookie, data ? data : "-");
             }
             break;
 
         case SD_BUS_MESSAGE_METHOD_ERROR:
-            selfLogInf("\033[1;31mE \033[1;32m%s \033[0m[\033[1;33m%s\033[0m] (\033[0;35m%s\033[0m) from \033[0;37m%s\033[0m", memb, name, data ? data : "-", iface);
+            if (prev) {
+                selfLogInf("\033[1;31mE \033[1;32m%s \033[0m[\033[1;33m%s\033[0m] (\033[0;35m%s\033[0m) from \033[0;37m%s\033[0m", prev->memb, prev->name, data ? data : "-", prev->iface);
+            }
             break;
 
         default:
-            selfLogInf("Unknown message type");
+            selfLogWrn("Unknown message type");
     }
 
-    if (reply) {
-        free (reply);
+    if (prev) {
+        bus_free_cache (prev);
     }
 
 }
