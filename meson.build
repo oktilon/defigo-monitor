@@ -1,6 +1,6 @@
 project(
     'monitor', 'c',
-    version : '1.0.0',
+    version : '1.0.1',
     meson_version : '> 0.53.0')
 
 # Global parameters
@@ -21,7 +21,7 @@ inc = include_directories('include')
 
 # Sources
 src = [
-      'src/bus.c'
+      'src/app_bus.c'
     , 'src/app.c'
 ]
 
